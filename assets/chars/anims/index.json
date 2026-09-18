@@ -1,1 +1,1 @@
-{"idle":{"dur":2.6667,"loop":true},"walk":{"dur":1.2,"loop":true},"run":{"dur":0.8,"loop":true},"sprint":{"dur":0.4667,"loop":true},"attack":{"dur":1.3333,"loop":false},"jump":{"dur":0.6667,"loop":false}}
+{"idle":{"dur":2.6667,"loop":true,"stride":0.0,"cphase":0.0},"walk":{"dur":1.2,"loop":true,"stride":1.05,"cphase":0.812},"run":{"dur":0.8,"loop":true,"stride":4.18,"cphase":0.531},"sprint":{"dur":0.4667,"loop":true,"stride":6.33,"cphase":0.536},"attack":{"dur":1.3333,"loop":false,"stride":0.0,"cphase":0.0},"jump":{"dur":0.6667,"loop":false,"stride":0.0,"cphase":0.0}}

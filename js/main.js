@@ -298,7 +298,8 @@ function spawnPlayer(x, z) {
   ch.group.position.set(x, G.world.heightAt(x, z), z);
   G.scene.add(ch.group);
   const ap = new AnimPlayer(ch.parts, G.anims);
-  ap.play('idle', 0.01);
+  ap.setSpeed(0);
+  ch.group.rotation.order = 'YXZ';    // 先偏航再俯仰/侧倾(倾斜在角色自身坐标系内)
   G.player = {
     obj: ch.group, parts: ch.parts, height: ch.height, ap,
     speed: 0, vy: 0, grounded: true,
@@ -324,7 +325,8 @@ function spawnNPCs() {
     const ch = makeChar(def.model);
     if (!ch) return;
     ch.group.position.set(bx, G.world.heightAt(bx, bz), bz);
-    ch.group.rotation.y = Math.atan2(G.meta.spawn[0] - bx, G.meta.spawn[1] - bz);
+    // 模型前方为局部 -Z，故取反使 NPC 面朝出生点
+    ch.group.rotation.y = Math.atan2(bx - G.meta.spawn[0], bz - G.meta.spawn[1]);
     G.scene.add(ch.group);
     const label = makeLabelSprite(def.name, '#ffe9ad', def.role);
     // 角色整体被缩放到 0.01，名牌要保持世界尺寸，需要反向补偿
@@ -334,7 +336,7 @@ function spawnNPCs() {
     ch.group.add(label);
     // 原版待机动画（呼吸/重心变化），各角色共用 Bip01 骨架命名
     const ap = new AnimPlayer(ch.parts, G.anims);
-    ap.play('idle', 0.01);
+    ap.setSpeed(0);
     G.npcs.push({ def, obj: ch.group, parts: ch.parts, ap, region: r.name, pos: new V3(bx, 0, bz), questGiven: false });
   });
 }
@@ -541,28 +543,49 @@ function spawnPickups() {
 // ================= 玩家更新 =================
 const _f = new V3(), _r = new V3(), _np = new V3();
 
+// 移动速度 = 动画原生步速（tools/probe_stride.js 在渲染环境实测：跑 4.18 / 冲刺 6.33 m/s）。
+// 播放速率 = 实际速度／原生步速，故在原生速度下速率为 1.0：步频自然、支撑脚零漂移。
+const MOVE_SPEED = 4.2;
+const SPRINT_SPEED = 6.3;
+
 function updatePlayer(dt) {
   const p = G.player, w = G.world;
   if (!p.alive) return;
-  const sp = (G.keys['shift'] ? 11.5 : 5.6) * (p.swim ? 0.55 : 1);
+  // 目标速度（含游泳减速）
+  let target = (G.keys['shift'] ? SPRINT_SPEED : MOVE_SPEED) * (p.swim ? 0.55 : 1);
   let ix = 0, iz = 0;
   if (G.keys['w']) iz -= 1; if (G.keys['s']) iz += 1;
   if (G.keys['a']) ix -= 1; if (G.keys['d']) ix += 1;
   const moving = ix || iz;
+  if (!moving) target = 0;
+  if (!p.grounded && !p.swim) target *= 0.85;      // 空中略减速
+
+  // 平滑加减速（起步/收步不再瞬时切换；步态混合空间与播放速率随速度连续变化，
+  // 任意速度下脚的落地速度都与位移匹配，因此加减速全程不打滑）
+  const accel = (p.grounded ? (target > p.speed ? 11 : 13) : 5) * dt;
+  p.speed += Math.max(-accel, Math.min(accel, target - p.speed));
+  if (p.speed < 0.02) p.speed = 0;
+
+  let turnRate = 0;
   if (moving) {
-    const a = Math.atan2(ix, -iz);
-    const dir = G.yaw + a + Math.PI;
+    // 屏幕方向映射：W 朝屏幕内(远离相机)、D 朝屏幕右，A/S 同理。
+    // (原实现把 W 映射成"朝相机走"，导致世界朝屏幕内滚动、观感别扭)
+    const a = Math.atan2(-ix, -iz);
+    const dir = G.yaw + a;
     _f.set(Math.sin(dir), 0, Math.cos(dir));
-    p.obj.position.addScaledVector(_f, sp * dt);
-    p.yawFace = Math.atan2(_f.x, _f.z);
+    // 原版模型视觉前方为局部 -Z：偏航要按 -Z 对齐行进方向，
+    // 否则角色背对行进方向(月球漫步)，脚部也会相对地面打滑 2 倍。
+    p.yawFace = Math.atan2(-_f.x, -_f.z);
+    if (p.speed > 0) p.obj.position.addScaledVector(_f, p.speed * dt);
   }
   // 平滑转身：角色朝向快速插值到移动方向，避免瞬时掉头
   {
     let d = p.yawFace - p.obj.rotation.y;
     d = Math.atan2(Math.sin(d), Math.cos(d));
-    p.obj.rotation.y += d * Math.min(1, dt * 12);
+    const step = d * Math.min(1, dt * 12);
+    p.obj.rotation.y += step;
+    turnRate = dt > 0 ? step / dt : 0;
   }
-  p.speed = moving ? sp : 0;
 
   // 地形 / 游泳
   const x = p.obj.position.x, z = p.obj.position.z;
@@ -574,32 +597,38 @@ function updatePlayer(dt) {
     p.obj.position.y += (targetY - p.obj.position.y) * Math.min(1, dt * 6);
     p.vy = 0; p.grounded = true;
   } else {
-    if (p.grounded && G.keys[' ']) { p.vy = 8.2; p.grounded = false; }
+    if (p.grounded && G.keys[' ']) {
+      p.vy = 8.2; p.grounded = false;
+      if (p.ap) p.ap.playAction('jump', { fadeIn: 0.06, fadeOut: 0.18, rate: 1.1, hold: true });
+    }
     p.vy -= 22 * dt;
     p.obj.position.y += p.vy * dt;
     const floor = gh;
-    if (p.obj.position.y <= floor) { p.obj.position.y = floor; p.vy = 0; p.grounded = true; }
+    if (p.obj.position.y <= floor) {
+      if (!p.grounded && p.ap) p.ap.releaseAction();     // 落地：释放跳跃动作，混合回步态
+      p.obj.position.y = floor; p.vy = 0; p.grounded = true;
+    }
   }
-  // ---- 原版动画状态机 ----
-  // 优先级：攻击 > 空中(跳跃) > 游泳 > 冲刺/跑/走 > 待机
+  // 游泳时压低动作权重，让身体贴着水面
+  if (p.swim) p.obj.position.y += Math.sin(perfNow() * 1.6) * 0.02;
+
+  // ---- 动画：速度直接驱动步态混合空间，动作层另行上覆 ----
   const ap = p.ap;
   if (ap) {
-    const attacking = ap.clipName === 'attack' && !ap.done;
-    if (!attacking) {
-      if (!p.grounded && !p.swim) {
-        ap.play('jump', 0.12, 1.15);           // 空中保持跳跃姿势(播完钳在末帧)
-      } else if (p.swim) {
-        // 泳姿：半速奔跑划水 + 待机漂浮
-        if (p.speed > 0.5) ap.play('run', 0.3, 0.55);
-        else ap.play('idle', 0.5, 0.7);
-      } else if (moving) {
-        if (sp > 8) ap.play('sprint', 0.2, sp / 10.2);   // 步频跟随实际速度
-        else ap.play('run', 0.25, sp / 5.0);
-      } else {
-        ap.play('idle', 0.35, 1);
-      }
-    }
+    ap.setSpeed(p.speed);
     ap.update(dt);
+  }
+
+  // ---- 身体倾斜(ALS lean)：加速前倾 + 转向侧倾，动态细微 ----
+  // 模型前方为 -Z：前倾 = rotation.x 取负，转向内侧倾 = rotation.z 与偏航速率同号
+  {
+    const accNow = (p.speed - (p.lastSpeed || 0)) / Math.max(dt, 1e-4);
+    p.leanA = (p.leanA || 0) + (THREE.MathUtils.clamp(-accNow * 0.008, -0.12, 0.12) - (p.leanA || 0)) * Math.min(1, dt * 4);
+    p.leanT = (p.leanT || 0) + (THREE.MathUtils.clamp(turnRate * 0.5, -0.12, 0.12) - (p.leanT || 0)) * Math.min(1, dt * 5);
+    const air = (!p.grounded && !p.swim) ? 0.4 : 1;
+    p.obj.rotation.x = p.leanA * air;
+    p.obj.rotation.z = p.leanT * air;
+    p.lastSpeed = p.speed;
   }
 
   // 攻击输入
@@ -630,8 +659,8 @@ function tryAttack(ranged) {
   if (!p.alive || G.attackCd > 0 || (ranged && G.skillCd > 0)) return;
   const sk = ranged ? SKILLS[1] : SKILLS[0];
   G.attackCd = sk.cd; if (ranged) G.skillCd = sk.cd;
-  // 原版剑法动画：普攻 2.2x 让整套斩击落在 0.6s 内；气刃 1.6x 蓄力感
-  if (p.ap) p.ap.play('attack', 0.06, ranged ? 1.6 : 2.2);
+  // 原版剑法动画：作为上覆动作播放，结束自动混回步态
+  if (p.ap) p.ap.playAction('attack', { fadeIn: 0.05, fadeOut: 0.16, rate: ranged ? 1.5 : 1.9 });
   // 软锁定：出手前自动转向身周最近的目标，避免"背对着打空气"
   let near = null, nd = 1e9;
   for (const m of G.monsters) {
@@ -641,9 +670,10 @@ function tryAttack(ranged) {
   }
   if (near) {
     const t = near.obj.position.clone().sub(p.obj.position); t.y = 0;
-    if (t.lengthSq() > 1e-4) p.obj.rotation.y = Math.atan2(t.x, t.z);
+    if (t.lengthSq() > 1e-4) p.obj.rotation.y = Math.atan2(-t.x, -t.z);
   }
-  const fwd = new V3(Math.sin(p.obj.rotation.y), 0, Math.cos(p.obj.rotation.y));
+  // 模型前方 = 局部 -Z
+  const fwd = new V3(-Math.sin(p.obj.rotation.y), 0, -Math.cos(p.obj.rotation.y));
   let hitAny = false;
   for (const m of G.monsters) {
     if (m.dead || m.hp <= 0) continue;
