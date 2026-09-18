@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>charview</title>
+<style>html,body{margin:0;height:100%;background:#222}canvas{display:block}</style>
+</head>
+<body>
+<script type="module">
+import * as THREE from './js/three.module.js';
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8090a0);
+const camera = new THREE.PerspectiveCamera(45, innerWidth/innerHeight, 0.05, 100);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 1.1));
+const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+const sun2 = new THREE.DirectionalLight(0xffffff, 0.8);
+sun2.position.set(-3, 2, -2);
+scene.add(sun2);
+
+const grid = new THREE.GridHelper(10, 20, 0x666666, 0x444444);
+scene.add(grid);
+
+const id = new URLSearchParams(location.search).get('id') || '101';
+// 注意: 不能用 (get('groups') || '') 再 split——空字符串经 Number() 会变成 0，
+// 导致默认只渲染第 0 组。必须先判断参数是否存在。
+const gp = new URLSearchParams(location.search).get('groups');
+const onlyG = gp ? gp.split(',').map(Number).filter(v => !isNaN(v)) : [];
+const texOverride = new URLSearchParams(location.search).get('tex');   // key=path 覆盖贴图
+const qs = new URLSearchParams(location.search);
+const FLIP = qs.get('flipy') === '1';   // 默认 false：DDS 首行=顶行，v=0 在顶
+const WRAP = qs.get('wrap') !== '0';    // 默认 true：原版 UV 可越界
+const meta = await (await fetch('./assets/chars/' + id + '.json')).json();
+const buf = await (await fetch('./assets/chars/' + id + '.bin')).arrayBuffer();
+const nv = meta.counts.verts, ni = meta.counts.idx, o = meta.offsets;
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, o.pos, nv*3), 3));
+geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(buf, o.nrm, nv*3), 3));
+geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(buf, o.uv, nv*2), 2));
+geo.setAttribute('skinIndex', new THREE.BufferAttribute(new Uint16Array(buf, o.bi, nv*4), 4));
+geo.setAttribute('skinWeight', new THREE.BufferAttribute(new Float32Array(buf, o.bw, nv*4), 4));
+geo.setIndex(new THREE.BufferAttribute(new Uint32Array(buf, o.idx, ni), 1));
+
+const texKeys = Object.keys(meta.tex);
+const mats = texKeys.map(k => {
+  const t = new THREE.TextureLoader().load('./assets/chars/' + (texOverride && texOverride.split(':')[0] === k ? texOverride.split(':')[1] : meta.tex[k]));
+  t.colorSpace = THREE.SRGBColorSpace;
+  // 原版 UV 带符号(可越界)，必须 WRAP 寻址，否则边缘会被拉伸
+  t.wrapS = t.wrapT = WRAP ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+  t.flipY = FLIP;
+  return new THREE.MeshLambertMaterial({ map: t, side: THREE.DoubleSide });
+});
+const matOf = {}; texKeys.forEach((k,i)=>matOf[k]=i);
+let gi = 0;
+for (const g of meta.groups) {
+  const show = !onlyG.length || onlyG.includes(gi);
+  geo.addGroup(g.start, g.count, show ? (matOf[g.tex] ?? 0) : mats.length);
+  gi++;
+}
+mats.push(new THREE.MeshBasicMaterial({ colorWrite: false }));
+geo.computeBoundingSphere();
+
+const objs = meta.bones.map(b => {
+  const bn = new THREE.Bone();
+  bn.name = b.name;
+  bn.position.fromArray(b.p);
+  bn.quaternion.fromArray(b.q);
+  bn.scale.fromArray(b.s);
+  return bn;
+});
+const root = new THREE.Group();
+meta.bones.forEach((b,i) => {
+  if (b.parent >= 0) objs[b.parent].add(objs[i]); else root.add(objs[i]);
+});
+const mesh = new THREE.SkinnedMesh(geo, mats);
+mesh.add(root);
+root.updateMatrixWorld(true);
+const skel = new THREE.Skeleton(objs, objs.map(x => x.matrixWorld.clone().invert()));
+mesh.bind(skel, new THREE.Matrix4());
+// 与游戏一致：缩放 0.01，脚底贴地
+mesh.position.y = -meta.bounds.min[1];
+const g2 = new THREE.Group();
+g2.add(mesh);
+g2.scale.setScalar(meta.scale);
+scene.add(g2);
+
+window.__cam = (yaw, pitch, dist, ty) => {
+  const h = (meta.bounds.max[1]-meta.bounds.min[1]) * meta.scale;
+  const cy = ty ?? h*0.6;
+  const cx = Math.sin(yaw)*Math.cos(pitch)*dist;
+  const cz = Math.cos(yaw)*Math.cos(pitch)*dist;
+  camera.position.set(cx, cy + Math.sin(pitch)*dist, cz);
+  camera.lookAt(0, cy, 0);
+};
+window.__done = true;
+
+let yaw = Math.PI, pitch = 0.05, dist = 4.2, ty = null;
+window.__set = (y,p,d,t) => { yaw=y; pitch=p; dist=d; ty=t; };
+function loop(){
+  requestAnimationFrame(loop);
+  window.__cam(yaw, pitch, dist, ty);
+  renderer.render(scene, camera);
+}
+loop();
+</script>
+</body>
+</html>

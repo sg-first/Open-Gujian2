@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>propview</title>
+<style>html,body{margin:0;height:100%;background:#1d2024;overflow:hidden}canvas{display:block}
+#hud{position:fixed;left:8px;top:8px;color:#cfe3ff;font:12px/1.5 monospace;z-index:9;
+     background:rgba(0,0,0,.45);padding:6px 9px;border-radius:4px;pointer-events:none}</style>
+</head>
+<body>
+<div id="hud"></div>
+<script type="module">
+import * as THREE from './js/three.module.js';
+
+const qs = new URLSearchParams(location.search);
+const REGION = qs.get('region') || '';
+const N = Number(qs.get('n') || 12);
+const COLS = Number(qs.get('cols') || 6);
+const TILE = 26;                    // 每格世界尺寸(米)
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1d2024);
+const camera = new THREE.PerspectiveCamera(38, innerWidth / innerHeight, 0.1, 2000);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+const sun = new THREE.DirectionalLight(0xfff2dd, 1.6);
+sun.position.set(0.55, 0.75, 0.35);
+scene.add(sun);
+const fill = new THREE.DirectionalLight(0xbfd4ff, 0.55);
+fill.position.set(-0.6, 0.35, -0.5);
+scene.add(fill);
+
+const idx = await (await fetch('./assets/props/index.json')).json();
+const buf = await (await fetch('./assets/props/props.bin')).arrayBuffer();
+const texLoader = new THREE.TextureLoader();
+const matCache = new Map();
+const matOf = (tex) => {
+  if (!tex) return new THREE.MeshLambertMaterial({ color: 0x8a7d6a, side: THREE.DoubleSide });
+  if (matCache.has(tex)) return matCache.get(tex);
+  const t = texLoader.load('./assets/props/' + tex);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4;
+  const m = new THREE.MeshLambertMaterial({ map: t, side: THREE.DoubleSide });
+  matCache.set(tex, m);
+  return m;
+};
+
+let list = idx.props;
+if (REGION) list = list.filter((p) => p.region === REGION);
+list = list.slice(0, N);
+
+const rows = Math.ceil(list.length / COLS);
+const totalW = COLS * TILE, totalD = rows * TILE;
+const info = [];
+list.forEach((p, i) => {
+  const c = i % COLS, r = Math.floor(i / COLS);
+  const cx = (c - (COLS - 1) / 2) * TILE;
+  const cz = (r - (rows - 1) / 2) * TILE;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(buf, p.vOff, p.nv * 3), 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(buf, p.nOff, p.nv * 3), 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(buf, p.uOff, p.nv * 2), 2));
+  geo.setIndex(new THREE.BufferAttribute(
+    p.i16 !== false ? new Uint16Array(buf, p.iOff, p.ni) : new Uint32Array(buf, p.iOff, p.ni), 1));
+  geo.computeBoundingBox();
+  const m = new THREE.Mesh(geo, matOf(p.tex));
+  const b = geo.boundingBox;
+  const w = Math.max(b.max.x - b.min.x, b.max.z - b.min.z, 0.001);
+  const k = Math.min(1, (TILE * 0.82) / w);           // 按宽度归一化，便于横向比较体量
+  m.scale.setScalar(k);
+  m.position.set(cx, 0, cz);
+  scene.add(m);
+  const pad = new THREE.Mesh(new THREE.PlaneGeometry(TILE * 0.94, TILE * 0.94),
+    new THREE.MeshBasicMaterial({ color: i % 2 ? 0x272b30 : 0x22262a }));
+  pad.rotation.x = -Math.PI / 2; pad.position.set(cx, -0.02, cz);
+  scene.add(pad);
+  info.push(`${p.name} nv=${p.nv} uv=${p.exact ? 'exact' : 'FB'} ${p.size.map((v) => v.toFixed(1)).join('x')}`);
+});
+
+const spanW = Math.max(totalW, totalD);
+camera.position.set(spanW * 0.30, spanW * 0.42, spanW * 0.72);
+camera.lookAt(0, 0, 0);
+document.getElementById('hud').textContent =
+  `${list.length} props  region=${REGION || 'all'}  cols=${COLS}  meshes=${scene.children.length}\n` +
+  info.join('\n');
+
+// 必须持续渲染：headless 截图用一个合成帧，单次 render 后 drawingBuffer 会被丢弃
+renderer.setAnimationLoop(() => renderer.render(scene, camera));
+window.__done = true;
+</script>
+</body>
+</html>
