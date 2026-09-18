@@ -151,7 +151,8 @@ export function makeChar(id) {
   const bb = meta.bounds;
   const height = bb ? (bb.max[1] - bb.min[1]) * meta.scale : 1.82;
 
-  animateChar(parts, 0, 0, 0);
+  // 注意：这里不再调用 animateChar 摆默认姿势 ——
+  // AnimPlayer 需要纯净的 XAC 绑定姿态作为回退基准。
   return { group, parts, height, id };
 }
 

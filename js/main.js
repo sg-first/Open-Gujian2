@@ -1,8 +1,9 @@
 // main.js —— 开放世界主循环
 import * as THREE from 'three';
 import { World, CHUNK, createWater, createSky, vegTime, mulberry } from './world.js';
-import { makeChar, animateChar, preloadChars, loadCharProto, loadProps, makeProp, G_PROPS } from './assets.js';
+import { makeChar, preloadChars, loadCharProto, loadProps, makeProp, G_PROPS } from './assets.js';
 import { buildBeast, animateBeast, makeLabelSprite, updateHpSprite } from './entities.js';
+import { loadAnims, AnimPlayer } from './anim.js';
 import { loadEnv } from './env.js';
 
 const $ = (id) => document.getElementById(id);
@@ -111,6 +112,9 @@ async function boot() {
     window.__step = 'chars';
     setLoad(80, '唤醒故人身影…');
     await preloadChars(CHAR_IDS);
+    window.__step = 'anims';
+    setLoad(84, '传授举止身法…');
+    G.anims = await loadAnims(['idle', 'walk', 'run', 'sprint', 'attack', 'jump']);
     window.__step = 'props';
     setLoad(88, '搬来屋舍桥梁…');
     G.props = null;
@@ -293,8 +297,10 @@ function spawnPlayer(x, z) {
   if (!ch) { console.error('player model missing'); return; }
   ch.group.position.set(x, G.world.heightAt(x, z), z);
   G.scene.add(ch.group);
+  const ap = new AnimPlayer(ch.parts, G.anims);
+  ap.play('idle', 0.01);
   G.player = {
-    obj: ch.group, parts: ch.parts, height: ch.height,
+    obj: ch.group, parts: ch.parts, height: ch.height, ap,
     speed: 0, vy: 0, grounded: true,
     hp: 180, maxHp: 180, xp: 0, lvl: 1, xpNext: 100,
     attackT: 0, swim: false, alive: true, yawFace: 0,
@@ -326,7 +332,10 @@ function spawnNPCs() {
     label.scale.set(1.9 / s, 0.71 / s, 1);
     label.position.y = (ch.height + 0.55) / s;
     ch.group.add(label);
-    G.npcs.push({ def, obj: ch.group, parts: ch.parts, region: r.name, pos: new V3(bx, 0, bz), questGiven: false });
+    // 原版待机动画（呼吸/重心变化），各角色共用 Bip01 骨架命名
+    const ap = new AnimPlayer(ch.parts, G.anims);
+    ap.play('idle', 0.01);
+    G.npcs.push({ def, obj: ch.group, parts: ch.parts, ap, region: r.name, pos: new V3(bx, 0, bz), questGiven: false });
   });
 }
 
@@ -546,7 +555,12 @@ function updatePlayer(dt) {
     _f.set(Math.sin(dir), 0, Math.cos(dir));
     p.obj.position.addScaledVector(_f, sp * dt);
     p.yawFace = Math.atan2(_f.x, _f.z);
-    p.obj.rotation.y = p.yawFace;
+  }
+  // 平滑转身：角色朝向快速插值到移动方向，避免瞬时掉头
+  {
+    let d = p.yawFace - p.obj.rotation.y;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    p.obj.rotation.y += d * Math.min(1, dt * 12);
   }
   p.speed = moving ? sp : 0;
 
@@ -566,8 +580,27 @@ function updatePlayer(dt) {
     const floor = gh;
     if (p.obj.position.y <= floor) { p.obj.position.y = floor; p.vy = 0; p.grounded = true; }
   }
-  animateChar(p.parts, p.speed, perfNow(), p.attackT);
-  if (p.attackT > 0) p.attackT = Math.max(0, p.attackT - dt * 2.2);
+  // ---- 原版动画状态机 ----
+  // 优先级：攻击 > 空中(跳跃) > 游泳 > 冲刺/跑/走 > 待机
+  const ap = p.ap;
+  if (ap) {
+    const attacking = ap.clipName === 'attack' && !ap.done;
+    if (!attacking) {
+      if (!p.grounded && !p.swim) {
+        ap.play('jump', 0.12, 1.15);           // 空中保持跳跃姿势(播完钳在末帧)
+      } else if (p.swim) {
+        // 泳姿：半速奔跑划水 + 待机漂浮
+        if (p.speed > 0.5) ap.play('run', 0.3, 0.55);
+        else ap.play('idle', 0.5, 0.7);
+      } else if (moving) {
+        if (sp > 8) ap.play('sprint', 0.2, sp / 10.2);   // 步频跟随实际速度
+        else ap.play('run', 0.25, sp / 5.0);
+      } else {
+        ap.play('idle', 0.35, 1);
+      }
+    }
+    ap.update(dt);
+  }
 
   // 攻击输入
   G.attackCd = Math.max(0, G.attackCd - dt);
@@ -597,7 +630,8 @@ function tryAttack(ranged) {
   if (!p.alive || G.attackCd > 0 || (ranged && G.skillCd > 0)) return;
   const sk = ranged ? SKILLS[1] : SKILLS[0];
   G.attackCd = sk.cd; if (ranged) G.skillCd = sk.cd;
-  p.attackT = 1;
+  // 原版剑法动画：普攻 2.2x 让整套斩击落在 0.6s 内；气刃 1.6x 蓄力感
+  if (p.ap) p.ap.play('attack', 0.06, ranged ? 1.6 : 2.2);
   // 软锁定：出手前自动转向身周最近的目标，避免"背对着打空气"
   let near = null, nd = 1e9;
   for (const m of G.monsters) {
@@ -730,12 +764,14 @@ function updateMonsters(dt) {
 }
 
 // ================= NPC 待机 =================
+const _npcDt = { v: 0 };
 function updateNPCs(now) {
+  const dt = Math.max(0.001, Math.min(0.05, now - (_npcDt.v || now - 0.016)));
+  _npcDt.v = now;
   for (const n of G.npcs) {
-    if (!n.parts) continue;
     if (n.obj.position.distanceTo(G.player.obj.position) > 320) { n.obj.visible = false; continue; }
     n.obj.visible = true;
-    animateChar(n.parts, 0, now, 0);
+    if (n.ap) n.ap.update(dt);
   }
 }
 
