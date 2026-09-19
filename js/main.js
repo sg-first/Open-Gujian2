@@ -5,6 +5,16 @@ import { makeChar, preloadChars, loadCharProto, loadProps, makeProp, G_PROPS } f
 import { buildBeast, animateBeast, makeLabelSprite, updateHpSprite } from './entities.js';
 import { loadAnims, AnimPlayer } from './anim.js';
 import { loadEnv } from './env.js';
+// 软阴影补丁：必须在任何材质首次编译前 import（副作用：改写 ShaderChunk）
+import './pcss.js';
+// 官方后处理链：GTAO(环境光遮蔽) / Bloom / ACES 输出 / FXAA
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
 
 const $ = (id) => document.getElementById(id);
 const V3 = THREE.Vector3;
@@ -173,14 +183,26 @@ async function preloadIcons() {
 }
 
 // ================= 场景 =================
+// 递归开启投影（跳过 Sprite/标记类）
+function enableShadows(root) {
+  root.traverse((o) => {
+    if (o.isMesh && !o.isSprite) { o.castShadow = true; o.receiveShadow = true; }
+  });
+}
+
 function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
   const scene = new THREE.Scene();
   G.scene = scene;
   G.camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.3, 12000);
-  G.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+  G.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
   G.renderer.setSize(innerWidth, innerHeight);
-  G.renderer.setPixelRatio(Math.min(devicePixelRatio, 1.75));
+  G.renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
   G.renderer.outputColorSpace = THREE.SRGBColorSpace;
+  // ---- UE4 级画质基线：ACES 色调映射 + 软阴影 ----
+  G.renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  G.renderer.toneMappingExposure = 1.05;
+  G.renderer.shadowMap.enabled = true;
+  G.renderer.shadowMap.type = THREE.PCFSoftShadowMap;   // 实际由 pcss.js 的 PCSS 分支接管
   $('app').appendChild(G.renderer.domElement);
 
   const world = new World(meta, heights, colormapTex);
@@ -188,7 +210,9 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
 
   // 地表：受光材质 + 原版法线图 + 原版石作/泥土平铺细节。
   // colormap 负责大尺度色相（雪线、岸线、区域色调），细节贴图负责近景质感。
-  world.terrainMat = new THREE.MeshLambertMaterial({ map: colormapTex });
+  world.terrainMat = new THREE.MeshStandardMaterial({
+    map: colormapTex, roughness: 0.96, metalness: 0.0, envMapIntensity: 0.5,
+  });
   if (terrainNrm) world.terrainMat.normalMap = terrainNrm;
   world.terrainMat.normalScale = new THREE.Vector2(2.1, 2.1);
   {
@@ -248,23 +272,121 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
 
   G.sky = createSky(scene);
 
+  // ---- 太阳：软阴影（PCSS 由 pcss.js 接管 PCFSoft 分支）----
   G.sun = new THREE.DirectionalLight(0xffffff, 1.6);
+  G.sun.castShadow = true;
+  G.sun.shadow.mapSize.set(2048, 2048);
+  {
+    const sc = G.sun.shadow.camera;
+    sc.near = 10; sc.far = 900;
+    sc.left = -90; sc.right = 90; sc.top = 90; sc.bottom = -90;
+  }
+  G.sun.shadow.bias = -0.0004;
+  G.sun.shadow.normalBias = 0.8;
+  G.sun.shadow.radius = 6;        // PCSS 基础搜索/过滤尺度（texel）
   scene.add(G.sun);
   G.sun.target.position.set(0, 0, 0);
   scene.add(G.sun.target);
-  G.ambient = new THREE.AmbientLight(0xbfd0e0, 0.9);
+  // IBL 之后环境光只做兜底，强度压低，避免把 GI 冲淡
+  G.ambient = new THREE.AmbientLight(0xbfd0e0, 0.35);
   scene.add(G.ambient);
-  G.hemi = new THREE.HemisphereLight(0x9db8d2, 0x3a4a33, 0.7);
+  G.hemi = new THREE.HemisphereLight(0x9db8d2, 0x3a4a33, 0.35);
   scene.add(G.hemi);
 
   scene.fog = new THREE.Fog(0xa8bdd0, 500, 5200);
+
+  // ---- 全局光照（IBL）：程序化天空 -> PMREM -> scene.environment ----
+  // 等效 UE4 的 SkyLight：所有 Standard 材质的间接漫反射/镜面反射都来自它。
+  G.pmrem = new THREE.PMREMGenerator(G.renderer);
+  G.envScene = new THREE.Scene();
+  G.envScene.add(new THREE.Mesh(G.sky.mesh.geometry, G.sky.mat));
+  G.envRT = null;
+  G._envIBLTimer = 99;   // 首帧立即生成
+  {
+    // 地面反弹补一点：纯天空 IBL 缺少地表漫射（UE4 SkyLight 也有 ground contribution）
+    const bounce = new THREE.Mesh(
+      new THREE.SphereGeometry(5000, 16, 8),
+      new THREE.MeshBasicMaterial({ color: 0x6a7a58, side: THREE.BackSide }));
+    bounce.position.y = -5600;
+    G.envScene.add(bounce);
+  }
+
+  // ---- 后处理链：RenderPass -> GTAO -> Bloom -> Output(ACES) -> FXAA ----
+  const rtSize = new THREE.Vector2(); G.renderer.getSize(rtSize);
+  const composerRT = new THREE.WebGLRenderTarget(rtSize.x, rtSize.y, {
+    type: THREE.HalfFloatType, samples: 4,     // MSAA 4x
+  });
+  G.composer = new EffectComposer(G.renderer, composerRT);
+  G.composer.addPass(new RenderPass(scene, G.camera));
+  G.gtao = new GTAOPass(scene, G.camera, rtSize.x, rtSize.y);
+  G.gtao.output = GTAOPass.OUTPUT.Default;
+  G.gtao.blendIntensity = 0.85;
+  G.gtao.updateGtaoMaterial({ radius: 0.4, distanceExponent: 2.0, thickness: 1.2,
+    scale: 1.1, samples: 12, screenSpaceRadius: false, distanceFallOff: 1.0 });
+  // GTAO 的深度/法线 pass 用 overrideMaterial，不识别 alphaTest 植被面片、
+  // 也不该把不写深度的天空/水面当遮挡体——渲染 AO 时临时隐藏（不影响主画面）
+  G._gtaoHidden = () => {
+    const out = [G.sky.mesh, G.water.mesh];
+    for (const e of G.world.chunks.values()) if (e.veg) out.push(e.veg);
+    return out;
+  };
+  const gtaoRender = G.gtao.render.bind(G.gtao);
+  G.gtao.render = function (...args) {
+    const hidden = G._gtaoHidden();
+    for (const o of hidden) o.visible = false;
+    gtaoRender(...args);
+    for (const o of hidden) o.visible = true;
+  };
+  G.composer.addPass(G.gtao);
+  G.bloom = new UnrealBloomPass(new THREE.Vector2(rtSize.x, rtSize.y), 0.18, 0.6, 0.85);
+  G.composer.addPass(G.bloom);
+  G.composer.addPass(new OutputPass());
+  G.fxaa = new ShaderPass(FXAAShader);
+  setFXAAResolution();
+  G.composer.addPass(G.fxaa);
 
   addEventListener('resize', () => {
     G.camera.aspect = innerWidth / innerHeight;
     G.camera.updateProjectionMatrix();
     G.renderer.setSize(innerWidth, innerHeight);
+    G.composer.setSize(innerWidth, innerHeight);
+    G.gtao.setSize(innerWidth, innerHeight);
+    G.bloom.setSize(innerWidth, innerHeight);
+    setFXAAResolution();
   });
   bindInput();
+}
+
+function setFXAAResolution() {
+  const pr = G.renderer.getPixelRatio();
+  G.fxaa.material.uniforms['resolution'].value.set(
+    1 / (innerWidth * pr), 1 / (innerHeight * pr));
+}
+
+// 阴影相机跟随玩家（贴身 90m 视锥保证 2048 贴图足够锐利）
+const _sunPos = new V3();
+function updateSunShadow() {
+  if (!G.player) return;
+  const pp = G.player.obj.position;
+  _sunPos.copy(pp).addScaledVector(G.sunDir, 380);
+  G.sun.position.copy(_sunPos);
+  G.sun.target.position.copy(pp);
+  G.sun.target.updateMatrixWorld();
+}
+
+// IBL 环境贴图随昼夜刷新（天空/太阳在动，PMREM 缓存 3 秒足够平滑）
+const _lastIBLDir = new V3();
+function updateEnvironmentIBL(dt) {
+  if (!G.pmrem) return;
+  G._envIBLTimer += dt;
+  const moved = _lastIBLDir.lengthSq() > 0 && _lastIBLDir.dot(G.sunDir) < 0.9995;
+  if (G._envIBLTimer < 12 && !moved) return;
+  G._envIBLTimer = 0;
+  _lastIBLDir.copy(G.sunDir);
+  const old = G.envRT;
+  G.envRT = G.pmrem.fromScene(G.envScene, 0.04, 10, 12000);
+  G.scene.environment = G.envRT.texture;
+  if (old) old.dispose();
 }
 
 // 原版模型加载完成后统一生成玩家 / NPC / 建筑 / 妖兽 / 采集点
@@ -297,6 +419,7 @@ function spawnPlayer(x, z) {
   if (!ch) { console.error('player model missing'); return; }
   ch.group.position.set(x, G.world.heightAt(x, z), z);
   G.scene.add(ch.group);
+  enableShadows(ch.group);
   const ap = new AnimPlayer(ch.parts, G.anims);
   ap.setSpeed(0);
   ch.group.rotation.order = 'YXZ';    // 先偏航再俯仰/侧倾(倾斜在角色自身坐标系内)
@@ -328,6 +451,7 @@ function spawnNPCs() {
     // 模型前方为局部 -Z，故取反使 NPC 面朝出生点
     ch.group.rotation.y = Math.atan2(bx - G.meta.spawn[0], bz - G.meta.spawn[1]);
     G.scene.add(ch.group);
+    enableShadows(ch.group);
     const label = makeLabelSprite(def.name, '#ffe9ad', def.role);
     // 角色整体被缩放到 0.01，名牌要保持世界尺寸，需要反向补偿
     const s = ch.group.scale.x || 1;
@@ -387,6 +511,7 @@ function spawnProps() {
     m.position.set(x, G.world.heightAt(x, z) - 0.35, z);
     m.rotation.y = rot;
     m.scale.setScalar(k);
+    enableShadows(m);
     G.scene.add(m);
     (G.propObjs || (G.propObjs = [])).push(m);
     return m;
@@ -472,6 +597,7 @@ function spawnMonsterCamps() {
         const { group, legs, body } = buildBeast(pal[0], 0.9 + rng() * 0.7);
         group.position.set(x, h, z);
         G.scene.add(group);
+        enableShadows(group);
         const spr = makeLabelSprite('', '#fff', '');
         spr.material.map.image.dataset.name = beastName(rng);
         spr.material.map.image.dataset.lvl = lvl;
@@ -824,6 +950,8 @@ function updateDayNight(dt) {
   const e = (t < 0 || t > 1) ? -0.42 : Math.sin(t * Math.PI) * noonElev;
   const sunDir = new V3(Math.cos(azim) * Math.cos(e), Math.sin(e), Math.sin(azim) * Math.cos(e)).normalize();
   G.sunDir = sunDir;
+  G.sun.castShadow = sunDir.y > 0.02;   // 太阳在地平线下时由 IBL/环境光接管，不再投影
+  updateSunShadow();
 
   G.sky.mat.uniforms.uSunDir.value.copy(sunDir);
   G.sun.position.copy(sunDir).multiplyScalar(1000);
@@ -831,17 +959,19 @@ function updateDayNight(dt) {
 
   if (env) {
     // ---- 光照（原版 LightAmbient / LightDiffuse / SunLum）----
+    // IBL(天空 PMREM) 已承担大部分间接光，直接光 + 少量兜底环境光即可，
+    // 强度按 ACES 色调映射重新配平。
     const amb = env.light.ambient, dif = env.light.diffuse, sl = env.sun;
     const aMul = env.light.ambientMul !== undefined ? env.light.ambientMul : 1;
     const dMul = env.light.diffuseMul !== undefined ? env.light.diffuseMul : 1;
     G.ambient.color.setRGB(amb[0], amb[1], amb[2]);
-    G.ambient.intensity = 0.45 + 1.05 * Math.min(2.0, aMul);
+    G.ambient.intensity = 0.12 + 0.35 * Math.min(2.0, aMul);
     G.sun.color.setRGB(dif[0], dif[1], dif[2]);
-    G.sun.intensity = Math.min(3.0, 0.35 + 0.42 * (sl.lum !== undefined ? sl.lum : 1.0))
-      * Math.min(2.0, dMul) * (0.25 + 0.75 * Math.max(0.0, sunDir.y * 3.0 + 0.3));
+    G.sun.intensity = Math.min(4.2, 0.55 + 0.65 * (sl.lum !== undefined ? sl.lum : 1.0))
+      * Math.min(2.0, dMul) * (0.2 + 0.8 * Math.max(0.0, sunDir.y * 2.4 + 0.25));
     G.hemi.color.setRGB(dif[0], dif[1], dif[2]);
     G.hemi.groundColor.setRGB(amb[0] * 0.8, amb[1] * 0.8, amb[2] * 0.8);
-    G.hemi.intensity = 0.30 + 0.55 * Math.min(1.5, aMul);
+    G.hemi.intensity = 0.10 + 0.30 * Math.min(1.5, aMul);
 
     // ---- 雾（原版 FogColor × FogColorMultiplier、FogIntensity 决定浓淡）----
     // 原版雾色是为 HDR 画面调的，直接拿来在 LDR 里会把远景压成深色块，
@@ -898,17 +1028,16 @@ function updateDayNight(dt) {
     G._envLabel = env.map;
   } else {
     const day = Math.max(0, Math.min(1, sunDir.y * 2.2 + 0.25));
-    G.sun.intensity = 1.7 * Math.max(0.02, sunDir.y);
-    G.ambient.intensity = 0.25 + 0.75 * day;
-    G.hemi.intensity = 0.2 + 0.55 * day;
+    G.sun.intensity = 2.4 * Math.max(0.02, sunDir.y);
+    G.ambient.intensity = 0.1 + 0.5 * day;
+    G.hemi.intensity = 0.1 + 0.3 * day;
     _fogC.setHex(0xa8c2d8).lerp(_tmpC.setHex(0x0a1018), 1 - day);
     G.scene.fog.color.copy(_fogC);
     G.renderer.setClearColor(_fogC);
   }
 
-  // 植被亮度跟随太阳高度
-  const vb = 0.45 + 0.55 * Math.max(0, Math.min(1, sunDir.y * 2.4 + 0.35));
-  for (const mat of G.world.vegMatCache.values()) mat.color.setRGB(vb, vb, Math.min(1, vb * 1.02));
+  // IBL 环境贴图刷新（天空/太阳/云随昼夜变化）
+  updateEnvironmentIBL(dt);
 
   vegTime.value = perfNow();
   G.sky.mat.uniforms.uTime.value = perfNow();
@@ -1311,5 +1440,5 @@ function loop(t) {
   if (now - lastSave > 20) { lastSave = now; saveGame(); }
 
   drawMinimap();
-  G.renderer.render(G.scene, G.camera);
+  G.composer.render();
 }

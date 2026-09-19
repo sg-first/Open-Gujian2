@@ -134,6 +134,7 @@ export class World {
       const [cx, cz] = key.split(',').map(Number);
       const mesh = new THREE.Mesh(this.buildChunkGeometry(cx, cz, stride), this.terrainMat);
       mesh.matrixAutoUpdate = false;
+      mesh.receiveShadow = true;
       this.group.add(mesh);
       const entry = { cx, cz, stride, mesh, veg: null, vegBuilt: false };
       this.chunks.set(key, entry);
@@ -165,14 +166,19 @@ export class World {
       const tex = new THREE.TextureLoader().load('assets/' + vegKey);
       tex.colorSpace = THREE.SRGBColorSpace;
       tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
-      mat = new THREE.MeshBasicMaterial({
-        map: tex, transparent: false, alphaTest: 0.45, side: THREE.DoubleSide,
+      mat = new THREE.MeshStandardMaterial({
+        map: tex, alphaTest: 0.45, side: THREE.DoubleSide,
+        roughness: 0.95, metalness: 0.0, envMapIntensity: 0.55,
       });
       mat.onBeforeCompile = (sh) => {
         sh.uniforms.uTime = vegTime;
         sh.vertexShader = 'uniform float uTime;\nattribute float aPhase;\nattribute float aSway;\n' +
-          sh.vertexShader.replace('#include <begin_vertex>',
-            `#include <begin_vertex>
+          sh.vertexShader
+            .replace('#include <beginnormal_vertex>',
+              // 交叉面片无合理法线：按地面法线受光，让植被与地表明暗一致
+              'vec3 objectNormal = vec3( 0.0, 1.0, 0.0 );')
+            .replace('#include <begin_vertex>',
+              `#include <begin_vertex>
              float sway = sin(uTime*1.7 + aPhase) * 0.5 + sin(uTime*3.1 + aPhase*1.3)*0.3;
              transformed.x += sway * aSway;
              transformed.z += cos(uTime*1.4 + aPhase)*0.4 * aSway;`);
@@ -229,6 +235,8 @@ export class World {
     const mesh = new THREE.Mesh(g, mat);
     mesh.matrixAutoUpdate = false;
     mesh.frustumCulled = true;
+    mesh.castShadow = true;       // 树木/草丛投影（alphaTest 在深度材质中自动生效）
+    mesh.receiveShadow = true;
     return mesh;
   }
 }
