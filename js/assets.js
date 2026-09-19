@@ -46,11 +46,11 @@ export async function loadCharProto(id) {
     map: loadTexture(CHAR_BASE + meta.tex[k], true),
     side: THREE.DoubleSide,
     alphaTest: 0.42,
-    roughness: 0.85, metalness: 0.0, envMapIntensity: 0.65,
+    roughness: 0.92, metalness: 0.0, envMapIntensity: 0.45,
   }));
   const matOf = {};
   texKeys.forEach((k, i) => { matOf[k] = i; });
-  if (!texKeys.length) mats.push(new THREE.MeshStandardMaterial({ color: 0x8a7f6d, side: THREE.DoubleSide, roughness: 0.85, metalness: 0.0, envMapIntensity: 0.65 }));
+  if (!texKeys.length) mats.push(new THREE.MeshStandardMaterial({ color: 0x8a7f6d, side: THREE.DoubleSide, roughness: 0.92, metalness: 0.0, envMapIntensity: 0.45 }));
   for (const g of meta.groups) {
     geo.addGroup(g.start, g.count, matOf[g.tex] !== undefined ? matOf[g.tex] : 0);
   }
@@ -241,7 +241,7 @@ export async function loadProps() {
   const idx = await (await fetch(PROP_BASE + 'index.json')).json();
   const buf = await (await fetch(PROP_BASE + 'props.bin')).arrayBuffer();
   const matCache = new Map();
-  const fallback = new THREE.MeshStandardMaterial({ color: 0x6d6255, side: THREE.DoubleSide, roughness: 0.92, metalness: 0.0, envMapIntensity: 0.55 });
+  const fallback = new THREE.MeshStandardMaterial({ color: 0x6d6255, side: THREE.DoubleSide, roughness: 0.96, metalness: 0.0, envMapIntensity: 0.35 });
 
   const matOf = (tex) => {
     if (!tex) return fallback;
@@ -249,7 +249,7 @@ export async function loadProps() {
     const m = new THREE.MeshStandardMaterial({
       map: loadTexture(PROP_BASE + tex, false),
       side: THREE.DoubleSide,
-      roughness: 0.92, metalness: 0.0, envMapIntensity: 0.55,
+      roughness: 0.96, metalness: 0.0, envMapIntensity: 0.35,
     });    matCache.set(tex, m);
     return m;
   };

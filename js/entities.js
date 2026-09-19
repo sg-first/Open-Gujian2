@@ -2,7 +2,7 @@
 // 玩家与 NPC 已改用原版 XAC 模型（见 assets.js），这里只保留原版资产里没有的妖兽。
 import * as THREE from 'three';
 
-const skinMat = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.85, metalness: 0.0, envMapIntensity: 0.6 });
+const skinMat = (c) => new THREE.MeshStandardMaterial({ color: c, roughness: 0.92, metalness: 0.0, envMapIntensity: 0.45 });
 
 // 名字 / 血条 sprite
 export function makeLabelSprite(text, color = '#ffffff', sub = null) {

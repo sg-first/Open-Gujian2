@@ -200,7 +200,7 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
   G.renderer.outputColorSpace = THREE.SRGBColorSpace;
   // ---- UE4 级画质基线：ACES 色调映射 + 软阴影 ----
   G.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  G.renderer.toneMappingExposure = 1.05;
+  G.renderer.toneMappingExposure = 1.15;
   G.renderer.shadowMap.enabled = true;
   G.renderer.shadowMap.type = THREE.PCFSoftShadowMap;   // 实际由 pcss.js 的 PCSS 分支接管
   $('app').appendChild(G.renderer.domElement);
@@ -211,7 +211,7 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
   // 地表：受光材质 + 原版法线图 + 原版石作/泥土平铺细节。
   // colormap 负责大尺度色相（雪线、岸线、区域色调），细节贴图负责近景质感。
   world.terrainMat = new THREE.MeshStandardMaterial({
-    map: colormapTex, roughness: 0.96, metalness: 0.0, envMapIntensity: 0.5,
+    map: colormapTex, roughness: 1.0, metalness: 0.0, envMapIntensity: 0.22,
   });
   if (terrainNrm) world.terrainMat.normalMap = terrainNrm;
   world.terrainMat.normalScale = new THREE.Vector2(2.1, 2.1);
@@ -222,13 +222,14 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
       sh.uniforms.uStone = { value: d2 };
       sh.uniforms.uSlab = { value: d3 };
       sh.uniforms.uSea = { value: world.sea };
+      sh.uniforms.uBump = { value: 0.9 };   // 细节凹凸强度（屏幕空间高度梯度）
       sh.vertexShader = `attribute float aSlope;\nattribute float aAlt;\n
         varying vec3 vWp;\n varying float vSlope;\n varying float vAlt;\n` + sh.vertexShader
         .replace('#include <begin_vertex>',
           '#include <begin_vertex>\n vWp = position;\n vSlope = aSlope;\n vAlt = aAlt;');
       sh.fragmentShader = `
         uniform sampler2D uDirt, uStone, uSlab;
-        uniform float uSea;
+        uniform float uSea, uBump;
         varying vec3 vWp; varying float vSlope; varying float vAlt;
       ` + sh.fragmentShader
         .replace('#include <map_fragment>',
@@ -247,6 +248,7 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
            vec3 det = mix(c1, c2, rock);
            det = mix(det, mix(c2, c3, 0.35), alp);             // 高处主要是裸岩，不是铺装
            det = mix(det, det * (0.55 + 0.9 * dot(c4, vec3(0.333))), 0.35);
+           float detH = dot(det, vec3(0.299,0.587,0.114));     // 细节高度场（供凹凸求导）
            float dl = max(0.20, dot(det, vec3(0.299,0.587,0.114)));
            vec3 base = diffuseColor.rgb;
            float bl = max(0.06, dot(base, vec3(0.299,0.587,0.114)));
@@ -261,7 +263,20 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
            // 3) 岸线：贴水面的滩涂压暖
            float shore = 1.0 - smoothstep(0.0, 3.0, vWp.y - uSea);
            diffuseColor.rgb = mix(diffuseColor.rgb, diffuseColor.rgb * vec3(1.20,1.06,0.82), shore*0.65);
-           `);
+           `)
+        // 细节凹凸：用细节高度场的屏幕空间梯度扰动法线（近景生效，远处淡出防噪点）
+        .replace('#include <normal_fragment_maps>',
+          `{
+             float bumpFade = (1.0 - smoothstep(50.0, 240.0, length(vWp - cameraPosition))) * uBump;
+             if (bumpFade > 0.001) {
+               vec2 dH = vec2( dFdx(detH), dFdy(detH) ) * bumpFade;
+               vec3 sX = dFdx( -vViewPosition );
+               vec3 sY = dFdy( -vViewPosition );
+               vec3 R1 = cross( sY, normal ), R2 = cross( normal, sX );
+               float fDet = dot( sX, R1 ) * faceDirection;
+               normal = normalize( abs( fDet ) * normal - sign( fDet ) * ( dH.x * R1 + dH.y * R2 ) );
+             }
+           }`);
     };
   }
   scene.add(world.group);
@@ -281,8 +296,8 @@ function initScene(meta, heights, colormapTex, terrainNrm, detailTex) {
     sc.near = 10; sc.far = 900;
     sc.left = -90; sc.right = 90; sc.top = 90; sc.bottom = -90;
   }
-  G.sun.shadow.bias = -0.0004;
-  G.sun.shadow.normalBias = 0.8;
+  G.sun.shadow.bias = -0.0006;
+  G.sun.shadow.normalBias = 0.35;   // 过大会在清晨侧光时造成大片地形错误自阴影
   G.sun.shadow.radius = 6;        // PCSS 基础搜索/过滤尺度（texel）
   scene.add(G.sun);
   G.sun.target.position.set(0, 0, 0);
@@ -374,13 +389,13 @@ function updateSunShadow() {
   G.sun.target.updateMatrixWorld();
 }
 
-// IBL 环境贴图随昼夜刷新（天空/太阳在动，PMREM 缓存 3 秒足够平滑）
+// IBL 环境贴图随昼夜刷新（一昼夜 10 分钟，12 秒一刷 = 每 2.9 游戏小时，
+// 天色渐变肉眼平滑；严禁每帧重建——清晨太阳移动快时会绕过节流压垮渲染）
 const _lastIBLDir = new V3();
 function updateEnvironmentIBL(dt) {
   if (!G.pmrem) return;
   G._envIBLTimer += dt;
-  const moved = _lastIBLDir.lengthSq() > 0 && _lastIBLDir.dot(G.sunDir) < 0.9995;
-  if (G._envIBLTimer < 12 && !moved) return;
+  if (G._envIBLTimer < 12) return;
   G._envIBLTimer = 0;
   _lastIBLDir.copy(G.sunDir);
   const old = G.envRT;
@@ -965,13 +980,15 @@ function updateDayNight(dt) {
     const aMul = env.light.ambientMul !== undefined ? env.light.ambientMul : 1;
     const dMul = env.light.diffuseMul !== undefined ? env.light.diffuseMul : 1;
     G.ambient.color.setRGB(amb[0], amb[1], amb[2]);
-    G.ambient.intensity = 0.12 + 0.35 * Math.min(2.0, aMul);
+    // 晨昏太阳贴地时靠环境补光保持暗部可读（UE4 SkyLight 的暗部表现）
+    const dayF = Math.max(0, Math.min(1, sunDir.y * 2.5 + 0.1));
+    G.ambient.intensity = 0.25 + 0.45 * dayF + 0.1 * Math.min(2.0, aMul);
     G.sun.color.setRGB(dif[0], dif[1], dif[2]);
     G.sun.intensity = Math.min(4.2, 0.55 + 0.65 * (sl.lum !== undefined ? sl.lum : 1.0))
       * Math.min(2.0, dMul) * (0.2 + 0.8 * Math.max(0.0, sunDir.y * 2.4 + 0.25));
     G.hemi.color.setRGB(dif[0], dif[1], dif[2]);
     G.hemi.groundColor.setRGB(amb[0] * 0.8, amb[1] * 0.8, amb[2] * 0.8);
-    G.hemi.intensity = 0.10 + 0.30 * Math.min(1.5, aMul);
+    G.hemi.intensity = 0.15 + 0.45 * dayF + 0.08 * Math.min(1.5, aMul);
 
     // ---- 雾（原版 FogColor × FogColorMultiplier、FogIntensity 决定浓淡）----
     // 原版雾色是为 HDR 画面调的，直接拿来在 LDR 里会把远景压成深色块，

@@ -168,7 +168,7 @@ export class World {
       tex.magFilter = THREE.LinearFilter; tex.minFilter = THREE.LinearMipmapLinearFilter;
       mat = new THREE.MeshStandardMaterial({
         map: tex, alphaTest: 0.45, side: THREE.DoubleSide,
-        roughness: 0.95, metalness: 0.0, envMapIntensity: 0.55,
+        roughness: 1.0, metalness: 0.0, envMapIntensity: 0.3,
       });
       mat.onBeforeCompile = (sh) => {
         sh.uniforms.uTime = vegTime;
